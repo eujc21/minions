@@ -1,5 +1,5 @@
-mod nostr_relay;
-mod relay_pool;
+pub mod nostr_relay;
+pub mod relay_pool;
 pub use nostr_relay::*;
 pub use relay_pool::*;
 
