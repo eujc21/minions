@@ -1,0 +1,155 @@
+name: Fork CI
+
+# Runs the project's checks against this fork's contribution branches, so a
+# pull request is verified here before it asks for a maintainer's time.
+#
+# Contribution branches are named NN-slug (NN is the upstream issue number)
+# and sit on top of the upstream default branch. This file lives only on the
+# fork's default branch, so the contribution branches stay free of it; start
+# it by hand:
+#
+#   gh workflow run fork-ci.yml                      # every NN-slug branch
+#   gh workflow run fork-ci.yml -f branches="26-a 27-b"
+on:
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: Branches to check, space separated. Empty means every NN-slug branch.
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  UPSTREAM_URL: https://github.com/illuminodes/minions
+  UPSTREAM_BRANCH: mera
+
+defaults:
+  run:
+    # `bash` (not the bare default) turns on pipefail, so a failed command in
+    # a pipeline fails its step.
+    shell: bash
+
+jobs:
+  branches:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.pick.outputs.list }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANTED: ${{ inputs.branches }}
+        run: |
+          if [ -n "$WANTED" ]; then
+            names="$WANTED"
+          else
+            names=$(gh api "repos/${{ github.repository }}/branches" --paginate --jq '.[].name' | grep -E '^[0-9]+-' | sort -n)
+          fi
+          echo "list=$(printf '%s\n' $names | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: branches
+    runs-on: ubuntu-latest
+    name: ${{ matrix.branch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.branches.outputs.list) }}
+    env:
+      HOST: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          # The change-risk ratchet compares against the upstream base commit.
+          fetch-depth: 0
+
+      # This workflow's own tooling (the ratchet script), from the fork's
+      # default branch. The branch under test does not carry it.
+      - uses: actions/checkout@v4
+        with:
+          path: .fork-ci
+          sparse-checkout: .github/scripts
+
+      - name: Toolchain
+        run: |
+          rustup target add wasm32-unknown-unknown
+          rustup component add llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Install cargo-crappy
+        run: cargo install cargo-crappy --version 0.1.2 --locked
+
+      # What the ratchets below compare against: the upstream commit this
+      # branch was cut from.
+      - name: Upstream base
+        run: |
+          git fetch --quiet "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          git worktree add --quiet ../upstream-base "$(git merge-base FETCH_HEAD HEAD)"
+
+      - name: Format
+        run: cargo fmt --check
+
+      # `.cargo/config.toml` defaults the target to wasm32, which cannot run a
+      # test binary, so the host is named.
+      - name: Test (host)
+        if: always()
+        run: cargo test --target "$HOST"
+
+      - name: Clippy (wasm32, default features)
+        if: always()
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Clippy (wasm32, optional features)
+        if: always()
+        run: cargo clippy --target wasm32-unknown-unknown --features sab-transport,bench-harness,test-components -- -D warnings
+
+      - name: Build (wasm32)
+        if: always()
+        run: cargo build --target wasm32-unknown-unknown
+
+      # The crate does not pass a flat `cargo crappy` threshold (the browser
+      # tree has no host coverage), so the gate is a ratchet: no function may
+      # score worse than on the upstream base, and no new one may cross it.
+      - name: Change-risk ratchet (cargo crappy)
+        if: always()
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+        run: |
+          (cd ../upstream-base && cargo crappy --threshold 30 > ../crappy-base.txt 2>&1) || true
+          cargo crappy --threshold 30 > ../crappy-head.txt 2>&1 || true
+          python3 .fork-ci/.github/scripts/crappy_ratchet.py ../crappy-base.txt ../crappy-head.txt
+
+      # Upstream's lockfile already carries advisories, so this is a ratchet
+      # too: the branch may not add an advisory, an unmaintained crate or a
+      # yanked version that the upstream base does not have.
+      - name: Dependency advisories ratchet (cargo audit)
+        if: always()
+        run: |
+          findings() {
+            cargo audit --json | jq -r '
+              [.vulnerabilities.list[].advisory.id]
+              + [.warnings | to_entries[] | .key as $kind | .value[]
+                 | (.advisory.id // "\($kind):\(.package.name)@\(.package.version)")]
+              | unique | .[]' | LC_ALL=C sort
+          }
+          # `cargo audit` exits 1 when it finds anything; the list is what counts.
+          (cd ../upstream-base && findings > ../audit-base.txt) || [ -s ../audit-base.txt ]
+          findings > ../audit-head.txt || [ -s ../audit-head.txt ]
+          added=$(comm -13 ../audit-base.txt ../audit-head.txt)
+          echo "upstream base: $(wc -l < ../audit-base.txt) findings, this branch: $(wc -l < ../audit-head.txt)"
+          if [ -n "$added" ]; then
+            echo "new on this branch:"; echo "$added"
+            exit 1
+          fi
+
+      # Advisories are covered by the ratchet above. Licenses need a
+      # `deny.toml` policy, which is the upstream maintainer's to choose.
+      - name: Dependency bans and sources (cargo deny)
+        if: always()
+        run: cargo deny check bans sources
